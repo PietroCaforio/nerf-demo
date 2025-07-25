@@ -1,0 +1,20 @@
+# blacklist everyhting
+*
+
+# don't blacklist directories
+!*/
+
+# and don't blacklist these files
+!.gitignore
+!*.md
+!*.py
+!*.ipynb
+!*.txt
+!*.csv
+!*.tsv
+!*.sh
+!*.yml
+!*.yaml
+!Makefile
+!*.tcia
+!*.json
