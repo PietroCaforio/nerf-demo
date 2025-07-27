@@ -12,6 +12,8 @@ from torch.utils.data import Dataset, DataLoader
 import torch.optim as optim
 import imageio
 import matplotlib.pyplot as plt
+import re
+from pathlib import Path
 
 class RayDataset(Dataset):
     def __init__(self, dataset_root, split='train', img_wh=(400, 400), samples_per_epoch=4096, mode='train'):
@@ -141,7 +143,7 @@ class NaiveNERF(nn.Module):
         )
         self.sigma_head = nn.Sequential(
             nn.Linear(last_dim, 1),
-            nn.ReLU()     # σ >= 0
+            nn.Softplus()
         )
 
     def forward(self, x):
@@ -153,14 +155,15 @@ class NaiveNERF(nn.Module):
         """
         features = self.shared_mlp(x)
         rgb = self.rgb_head(features)
-        sigma = self.sigma_head(features) + 1e-2  # prevents all-zero sigma
+        sigma = self.sigma_head(features)
         return torch.cat([rgb, sigma], dim=-1)
 
 def render_rays(rays, model, 
                 num_samples=64,
-                near=2.0,
+                near=1.0,
                 far=6.0,
-                device='cpu'):
+                device='cpu',
+                white_bkgd=True):
     """
     Args:
         rays: (N_rays, 6) tensor of [ray_o (3), ray_d (3)]
@@ -203,8 +206,12 @@ def render_rays(rays, model,
     
     # Weighted RGB output
     rgb_map = (weights.unsqueeze(-1) * rgb).sum(dim=1)  # (N_rays, 3)
-
+    
+    if white_bkgd:
+        acc = weights.sum(dim=1, keepdim=True)          # (N_rays, 1)
+        rgb_map = rgb_map + (1.0 - acc) * 1.0           # white bg
     return rgb_map
+
 
 def render_rays_in_chunks(rays, model, 
                           num_samples=64, 
@@ -232,51 +239,96 @@ def render_rays_in_chunks(rays, model,
 
     return torch.cat(rgb_out, dim=0)  # (N_rays, 3)
 
+def save_checkpoint(state, ckpt_dir, epoch, keep_last=3):
+    os.makedirs(ckpt_dir, exist_ok=True)
+    ckpt_path = Path(ckpt_dir) / f"model_epoch_{epoch:04d}.pt"
+    torch.save(state, ckpt_path)
+
+    # prune older
+    rx = re.compile(r"model_epoch_(\d+)\.pt$")
+    ckpts = []
+    for p in Path(ckpt_dir).glob("model_epoch_*.pt"):
+        m = rx.fullmatch(p.name)
+        if m:
+            ckpts.append((int(m.group(1)), p))
+    ckpts.sort(key=lambda t: t[0], reverse=True)
+    for _, p in ckpts[keep_last:]:
+        try: p.unlink()
+        except FileNotFoundError: pass
+
+    return str(ckpt_path)
+
 def train_nerf(model, train_dataset, val_dataset, 
-               epochs=1000, batch_size=1024, lr=5e-4, 
-               val_every=10, output_dir='val_output', device='cuda'):
+               epochs=10000, batch_size=1024, lr=5e-4, 
+               val_every=10, output_dir='val_output', device='cuda',
+               resume_path=None):
     
     model.to(device)
-    model.train()
     optimizer = optim.Adam(model.parameters(), lr=lr)
     criterion = nn.MSELoss()
-
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=4)
 
     os.makedirs(output_dir, exist_ok=True)
+    ckpt_dir = os.path.join(output_dir, "checkpoints")
+    os.makedirs(ckpt_dir, exist_ok=True)
 
-    for epoch in range(1, epochs + 1):
-        total_loss = 0
+    # ---- Resume logic ----
+    start_epoch = 0
+    if resume_path is not None and os.path.isfile(resume_path):
+        ckpt = torch.load(resume_path, map_location=device)
+        model.load_state_dict(ckpt['model_state_dict'], strict=True)
+        if 'optimizer_state_dict' in ckpt:
+            optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+            # Override LR with current argument (comment out to keep ckpt LR)
+            for pg in optimizer.param_groups:
+                pg['lr'] = lr
+            # Ensure optimizer state tensors are on correct device
+            for state in optimizer.state.values():
+                for k, v in state.items():
+                    if isinstance(v, torch.Tensor):
+                        state[k] = v.to(device)
+        start_epoch = int(ckpt.get('epoch', 0))
+        print(f"Resumed from '{resume_path}' at epoch {start_epoch}.")
+
+    model.train()
+
+    # Train from start_epoch+1 up to `epochs` (interpreted as the final target epoch)
+    for epoch in range(start_epoch + 1, epochs + 1):
+        total_loss = 0.0
 
         for rays, rgbs in train_loader:
             rays, rgbs = rays.to(device), rgbs.to(device)
-            preds = model(rays)
-            rgb_preds = preds[:, :3]
+            rgb_preds = render_rays(rays, model, num_samples=64, near=2.0, far=6.0, device=device)
             loss = criterion(rgb_preds, rgbs)
-
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
             total_loss += loss.item()
 
-        avg_loss = total_loss / len(train_loader)
-        print(f"[Epoch {epoch:04d}] Train Loss: {avg_loss:.6f}")
+        avg_loss = total_loss / max(1, len(train_loader))
+        print(f"[Epoch {epoch:04d}] Train Loss: {avg_loss:.6e}")
 
-        # --- Validation ---
+        # --- Validation + checkpoint ---
         if epoch % val_every == 0:
             model.eval()
             with torch.no_grad():
-                rays, rgbs_gt = val_dataset[0]  # (H*W, 6), (H*W, 3)
+                rays, _ = val_dataset[0]   # (H*W, 6), (H*W, 3)
                 rays = rays.to(device)
-                rgb_pred = render_rays_in_chunks(rays, model, device=device, chunk_size=1024)
-
+                rgb_pred = render_rays_in_chunks(rays, model, num_samples=64, near=2.0, far=6.0,
+                                                 chunk_size=2048, device=device)
 
                 H, W = val_dataset.img_wh[1], val_dataset.img_wh[0]
                 img_pred = rgb_pred.reshape(H, W, 3).cpu().numpy()
+                img_path = os.path.join(output_dir, f'epoch_{epoch:04d}.png')
+                imageio.imwrite(img_path, (img_pred * 255).astype('uint8'))
+                print(f"Saved validation image to {img_path}")
 
-                save_path = os.path.join(output_dir, f'epoch_{epoch:04d}.png')
-                imageio.imwrite(save_path, (img_pred * 255).astype('uint8'))
-                print(f"Saved validation image to {save_path}")
+                ckpt_path = save_checkpoint({
+                    'epoch': epoch,
+                    'model_state_dict': model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                }, ckpt_dir, epoch, keep_last=3)
+                print(f"Checkpoint saved to {ckpt_path} (kept last 3).")
             model.train()
 
 if __name__ == "__main__":
@@ -293,9 +345,10 @@ if __name__ == "__main__":
         model=model,
         train_dataset=train_dataset,
         val_dataset=val_dataset,
-        epochs=200,
+        epochs=10000,
         batch_size=1024,
-        val_every=10,
+        val_every=50,
         output_dir='./val_output',
-        device='cuda' if torch.cuda.is_available() else 'cpu'
+        device='cuda' if torch.cuda.is_available() else 'cpu',
+        resume_path = "./val_output/checkpoints/model_epoch_0400.pt"
     )
