@@ -7,3 +7,27 @@ Dataset of choice is from [this source (UCSD, ECCV 2020)](http://cseweb.ucsd.edu
 Training tiny naive NeRF (on CPU 😓)
 
 ![Training animation](./output.gif)
+
+### Requirements
+This project uses **Conda** for environment management.
+
+To set up everything:
+
+```bash
+make deps      # Create the Conda environment
+make data      # Download the dataset
+```
+
+### Run Experiments
+
+To run the NeRF baseline (simple MLP):
+
+```bash
+python run_nerf.py
+```
+
+To run the TensoRF version (tensor decomposition):
+
+```bash
+python run_tensorf.py
+```
