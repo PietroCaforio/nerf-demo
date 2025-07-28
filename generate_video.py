@@ -3,8 +3,8 @@ from PIL import Image, ImageDraw, ImageFont
 import imageio
 
 # Settings
-input_dir = './val_output/'         # Folder containing your images
-output_path = 'output.gif'  # Can also be 'output.mp4' if using ffmpeg writer
+input_dir = './val_output_tensorf/'         # Folder containing your images
+output_path = 'output_tensorf.gif'  # Can also be 'output.mp4' if using ffmpeg writer
 font_path = '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf'  # Adjust as needed
 font_size = 24
 

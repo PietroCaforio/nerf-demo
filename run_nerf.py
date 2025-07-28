@@ -345,10 +345,10 @@ if __name__ == "__main__":
         model=model,
         train_dataset=train_dataset,
         val_dataset=val_dataset,
-        epochs=10000,
+        epochs=40000,
         batch_size=1024,
         val_every=50,
         output_dir='./val_output',
         device='cuda' if torch.cuda.is_available() else 'cpu',
-        resume_path = "./val_output/checkpoints/model_epoch_0400.pt"
+        resume_path = "./val_output/checkpoints/model_epoch_10000.pt"
     )
