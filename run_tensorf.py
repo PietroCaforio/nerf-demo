@@ -380,7 +380,7 @@ def train_nerf(model, train_dataset, val_dataset,
                 rays, _ = val_dataset[0]  # one full image
                 rays = rays.to(device, non_blocking=True)
                 rgb_pred = render_rays_in_chunks(rays, model, num_samples=num_samples_val,
-                                                 chunk_size=8192, white_bkgd=white_bkgd, device=device)
+                                                 chunk_size=4096, white_bkgd=white_bkgd, device=device)
                 H, W = val_dataset.img_wh[1], val_dataset.img_wh[0]
                 img_pred = rgb_pred.reshape(H, W, 3).clamp(0, 1).cpu().numpy()
                 img_path = os.path.join(output_dir, f'epoch_{epoch:04d}.png')
@@ -401,8 +401,8 @@ def train_nerf(model, train_dataset, val_dataset,
 # -----------------------------
 if __name__ == "__main__":
     model = TensoRF_VM(
-        aabb=((-2.5, -2.5, -2.5), (2.5, 2.5, 2.5)),
-        grid_res=(128, 128, 128),
+        aabb=((-1.5, -1.5, -1.5), (1.5, 1.5, 1.5)),
+        grid_res=(256, 256, 256),
         sigma_rank=16,
         app_rank=24,
         app_dim=27,
@@ -419,9 +419,9 @@ if __name__ == "__main__":
         train_dataset=train_dataset,
         val_dataset=val_dataset,
         epochs=10000,
-        batch_size=2048,
-        num_samples_train=32,
-        num_samples_val=32,
+        batch_size=1024,
+        num_samples_train=128,
+        num_samples_val=128,
         lr_density=5e-3,        # lowered for stability
         lr_appearance=2e-3,
         lr_color=5e-4,
