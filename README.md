@@ -11,6 +11,11 @@ Training tiny naive NeRF
 Training naive TensoRF with very low rank and resolution
 
 ![Training animation](./output_tensorf.gif)
+
+Training naive TensoRF with higher rank and resolution
+
+![Training animation](./output_tensorf_new.gif)
+
 ### Requirements
 This project uses **Conda** for environment management.
 

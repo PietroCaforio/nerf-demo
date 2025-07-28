@@ -296,6 +296,9 @@ def save_checkpoint(state, ckpt_dir, epoch, keep_last=3):
 # -----------------------------
 # Training loop (AMP + resume, NaN-safe)
 # -----------------------------
+# -----------------------------
+# Training loop (AMP + resume, NaN-safe) with cosine LR
+# -----------------------------
 def train_nerf(model, train_dataset, val_dataset,
                epochs=10000, batch_size=2048,
                num_samples_train=32, num_samples_val=32,
@@ -306,9 +309,10 @@ def train_nerf(model, train_dataset, val_dataset,
     device = torch.device(device)
     model.to(device)
 
-    dens_params = list(model.density_planes.parameters()) + list(model.density_lines.parameters())
-    app_params  = list(model.app_planes.parameters())    + list(model.app_lines.parameters())
-    color_params= model.color_mlp.parameters()
+    # Optimizer with param groups
+    dens_params  = list(model.density_planes.parameters()) + list(model.density_lines.parameters())
+    app_params   = list(model.app_planes.parameters())     + list(model.app_lines.parameters())
+    color_params = model.color_mlp.parameters()
     optimizer = torch.optim.Adam([
         {'params': dens_params,  'lr': lr_density},
         {'params': app_params,   'lr': lr_appearance},
@@ -324,23 +328,32 @@ def train_nerf(model, train_dataset, val_dataset,
     os.makedirs(output_dir, exist_ok=True)
     ckpt_dir = os.path.join(output_dir, "checkpoints"); os.makedirs(ckpt_dir, exist_ok=True)
 
-    # Resume
+    # ----- Resume -----
     start_epoch = 0
     if resume_path is not None and os.path.isfile(resume_path):
         ckpt = torch.load(resume_path, map_location=device)
         model.load_state_dict(ckpt['model_state_dict'], strict=True)
         if 'optimizer_state_dict' in ckpt:
             optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+            # move optimizer state tensors to correct device
             for state in optimizer.state.values():
                 for k, v in state.items():
                     if isinstance(v, torch.Tensor):
                         state[k] = v.to(device)
+            # reset base LRs to the ones passed in
             for g, lr in zip(optimizer.param_groups, [lr_density, lr_appearance, lr_color]):
                 g['lr'] = lr
         start_epoch = int(ckpt.get('epoch', 0))
         print(f"Resumed from '{resume_path}' at epoch {start_epoch}.")
 
-    # Train
+    # Cosine LR over the remaining epochs (same scaling applied to all param groups)
+    # If you prefer cosine to the FINAL epoch regardless of resume, set T_max=epochs and
+    # call for _ in range(start_epoch): scheduler.step() instead.
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=5000, eta_min=0.0
+    )
+
+    # ----- Train -----
     model.train()
     for epoch in range(start_epoch + 1, epochs + 1):
         total_loss = 0.0
@@ -351,8 +364,10 @@ def train_nerf(model, train_dataset, val_dataset,
 
             optimizer.zero_grad(set_to_none=True)
             with torch.cuda.amp.autocast(enabled=(device.type == 'cuda'), dtype=torch.float16):
-                rgb_pred = render_rays_train(rays, model, num_samples=num_samples_train,
-                                             density_noise_std=1e-3, white_bkgd=white_bkgd, device=device)
+                rgb_pred = render_rays_train(
+                    rays, model, num_samples=num_samples_train,
+                    density_noise_std=1e-3, white_bkgd=white_bkgd, device=device
+                )
                 loss = criterion(rgb_pred, rgbs)
 
             # NaN guard
@@ -363,24 +378,35 @@ def train_nerf(model, train_dataset, val_dataset,
                 continue
 
             scaler.scale(loss).backward()
-            # Optional gradient clipping (helps stability)
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             scaler.step(optimizer)
             scaler.update()
 
             total_loss += loss.item()
 
+        # Log loss and current LRs (before stepping the scheduler)
         avg_loss = total_loss / max(1, len(train_loader))
-        print(f"[Epoch {epoch:04d}] Train Loss: {avg_loss:.6e}")
+        curr_lrs = [pg['lr'] for pg in optimizer.param_groups]
+        print(f"[Epoch {epoch:04d}] Train Loss: {avg_loss:.6e} | "
+              f"LRs: dens={curr_lrs[0]:.3e}, app={curr_lrs[1]:.3e}, color={curr_lrs[2]:.3e}")
 
-        # Validation + checkpoint
+        # Step cosine scheduler once per epoch
+        scheduler.step()
+
+        # ----- Validation + checkpoint -----
         if epoch % val_every == 0:
             model.eval()
             with torch.no_grad():
                 rays, _ = val_dataset[0]  # one full image
                 rays = rays.to(device, non_blocking=True)
-                rgb_pred = render_rays_in_chunks(rays, model, num_samples=num_samples_val,
-                                                 chunk_size=4096, white_bkgd=white_bkgd, device=device)
+                rgb_pred = render_rays_in_chunks(
+                    rays, model, num_samples=num_samples_val,
+                    chunk_rays=1024, samples_per_iter=16,  # memory-friendly version if you use it
+                    white_bkgd=white_bkgd, device=device.type
+                ) if 'samples_per_iter' in render_rays_in_chunks.__code__.co_varnames else \
+                    render_rays_in_chunks(rays, model, num_samples=num_samples_val,
+                                          chunk_size=4096, white_bkgd=white_bkgd, device=device)
+
                 H, W = val_dataset.img_wh[1], val_dataset.img_wh[0]
                 img_pred = rgb_pred.reshape(H, W, 3).clamp(0, 1).cpu().numpy()
                 img_path = os.path.join(output_dir, f'epoch_{epoch:04d}.png')
@@ -396,14 +422,15 @@ def train_nerf(model, train_dataset, val_dataset,
             model.train()
 
 
+
 # -----------------------------
 # Example main
 # -----------------------------
 if __name__ == "__main__":
     model = TensoRF_VM(
         aabb=((-1.5, -1.5, -1.5), (1.5, 1.5, 1.5)),
-        grid_res=(256, 256, 256),
-        sigma_rank=16,
+        grid_res=(128, 128, 128),
+        sigma_rank=24,
         app_rank=24,
         app_dim=27,
         hidden_color=64,
@@ -422,9 +449,9 @@ if __name__ == "__main__":
         batch_size=1024,
         num_samples_train=128,
         num_samples_val=128,
-        lr_density=5e-3,        # lowered for stability
-        lr_appearance=2e-3,
-        lr_color=5e-4,
+        lr_density=5e-2,        # lowered for stability
+        lr_appearance=2e-2,
+        lr_color=5e-3,
         val_every=50,
         output_dir='./val_output_tensorf',
         device='cuda' if torch.cuda.is_available() else 'cpu',
